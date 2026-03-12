@@ -1,0 +1,223 @@
+#cloud-config
+# Script de provisioning automatique exécuté au premier démarrage de la VM
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - python3
+  - python3-pip
+  - python3-venv
+  - git
+  - curl
+  - nginx
+
+write_files:
+  # ─── Variables d'environnement pour Flask ────────────────────────────────
+  - path: /opt/flaskapp/.env
+    permissions: "0600"
+    owner: flaskuser:flaskuser
+    content: |
+      FLASK_ENV=production
+      FLASK_APP=app.py
+      SECRET_KEY=change-me-in-production
+      DATABASE_URL=postgresql://${db_user}:${db_password}@${db_host}:5432/${db_name}
+      AZURE_STORAGE_ACCOUNT=${storage_account}
+      AZURE_STORAGE_KEY=${storage_key}
+      AZURE_CONTAINER_NAME=${container_name}
+
+  # ─── Code de l'application Flask ─────────────────────────────────────────
+  - path: /opt/flaskapp/app.py
+    permissions: "0644"
+    owner: flaskuser:flaskuser
+    content: |
+      import os
+      from flask import Flask, request, jsonify
+      from flask_sqlalchemy import SQLAlchemy
+      from azure.storage.blob import BlobServiceClient
+      from dotenv import load_dotenv
+      import uuid
+      from datetime import datetime
+
+      load_dotenv()
+
+      app = Flask(__name__)
+      app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL")
+      app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+      db = SQLAlchemy(app)
+
+      # ─── Modèle de base de données ────────────────────────────────────────
+      class FileMetadata(db.Model):
+          __tablename__ = "file_metadata"
+          id          = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+          filename    = db.Column(db.String(255), nullable=False)
+          blob_url    = db.Column(db.Text)
+          size_bytes  = db.Column(db.Integer)
+          uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+          description = db.Column(db.Text)
+
+          def to_dict(self):
+              return {
+                  "id":          self.id,
+                  "filename":    self.filename,
+                  "blob_url":    self.blob_url,
+                  "size_bytes":  self.size_bytes,
+                  "uploaded_at": self.uploaded_at.isoformat(),
+                  "description": self.description,
+              }
+
+      # ─── Client Azure Blob Storage ────────────────────────────────────────
+      def get_blob_client():
+          account  = os.getenv("AZURE_STORAGE_ACCOUNT")
+          key      = os.getenv("AZURE_STORAGE_KEY")
+          conn_str = f"DefaultEndpointsProtocol=https;AccountName={account};AccountKey={key};EndpointSuffix=core.windows.net"
+          return BlobServiceClient.from_connection_string(conn_str)
+
+      # ─── Routes ───────────────────────────────────────────────────────────
+
+      @app.route("/health", methods=["GET"])
+      def health():
+          return jsonify({"status": "ok", "message": "Flask app running on Azure VM"}), 200
+
+      # CREATE – Upload d'un fichier vers Blob Storage + métadonnées en BD
+      @app.route("/files", methods=["POST"])
+      def upload_file():
+          if "file" not in request.files:
+              return jsonify({"error": "No file provided"}), 400
+
+          file        = request.files["file"]
+          description = request.form.get("description", "")
+          blob_name   = f"{uuid.uuid4()}_{file.filename}"
+          container   = os.getenv("AZURE_CONTAINER_NAME")
+
+          blob_client = get_blob_client()
+          container_client = blob_client.get_container_client(container)
+          container_client.upload_blob(name=blob_name, data=file.read(), overwrite=True)
+
+          blob_url = f"https://{os.getenv('AZURE_STORAGE_ACCOUNT')}.blob.core.windows.net/{container}/{blob_name}"
+
+          meta = FileMetadata(
+              filename    = file.filename,
+              blob_url    = blob_url,
+              size_bytes  = file.content_length,
+              description = description,
+          )
+          db.session.add(meta)
+          db.session.commit()
+
+          return jsonify(meta.to_dict()), 201
+
+      # READ – Lister tous les fichiers
+      @app.route("/files", methods=["GET"])
+      def list_files():
+          files = FileMetadata.query.order_by(FileMetadata.uploaded_at.desc()).all()
+          return jsonify([f.to_dict() for f in files]), 200
+
+      # READ – Obtenir un fichier par ID
+      @app.route("/files/<file_id>", methods=["GET"])
+      def get_file(file_id):
+          meta = FileMetadata.query.get_or_404(file_id)
+          return jsonify(meta.to_dict()), 200
+
+      # UPDATE – Mettre à jour la description
+      @app.route("/files/<file_id>", methods=["PUT"])
+      def update_file(file_id):
+          meta = FileMetadata.query.get_or_404(file_id)
+          data = request.get_json()
+          if "description" in data:
+              meta.description = data["description"]
+          db.session.commit()
+          return jsonify(meta.to_dict()), 200
+
+      # DELETE – Supprimer le blob et les métadonnées
+      @app.route("/files/<file_id>", methods=["DELETE"])
+      def delete_file(file_id):
+          meta      = FileMetadata.query.get_or_404(file_id)
+          container = os.getenv("AZURE_CONTAINER_NAME")
+          blob_name = meta.blob_url.split("/")[-1]
+
+          blob_client = get_blob_client()
+          container_client = blob_client.get_container_client(container)
+          container_client.delete_blob(blob_name)
+
+          db.session.delete(meta)
+          db.session.commit()
+          return jsonify({"message": f"File {file_id} deleted"}), 200
+
+      if __name__ == "__main__":
+          with app.app_context():
+              db.create_all()
+          app.run(host="0.0.0.0", port=5000)
+
+  # ─── Fichier requirements.txt ─────────────────────────────────────────────
+  - path: /opt/flaskapp/requirements.txt
+    permissions: "0644"
+    content: |
+      Flask==3.0.2
+      Flask-SQLAlchemy==3.1.1
+      psycopg2-binary==2.9.9
+      azure-storage-blob==12.19.1
+      python-dotenv==1.0.1
+      gunicorn==21.2.0
+
+  # ─── Service systemd ──────────────────────────────────────────────────────
+  - path: /etc/systemd/system/flaskapp.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Flask Application Service
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=flaskuser
+      WorkingDirectory=/opt/flaskapp
+      EnvironmentFile=/opt/flaskapp/.env
+      ExecStart=/opt/flaskapp/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 app:app
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ─── Configuration Nginx (reverse proxy) ─────────────────────────────────
+  - path: /etc/nginx/sites-available/flaskapp
+    permissions: "0644"
+    content: |
+      server {
+          listen 80;
+          server_name _;
+
+          location / {
+              proxy_pass         http://127.0.0.1:5000;
+              proxy_http_version 1.1;
+              proxy_set_header   Upgrade $http_upgrade;
+              proxy_set_header   Connection keep-alive;
+              proxy_set_header   Host $host;
+              proxy_set_header   X-Real-IP $remote_addr;
+              proxy_cache_bypass $http_upgrade;
+          }
+      }
+
+runcmd:
+  # Créer l'utilisateur applicatif
+  - useradd -r -s /bin/false flaskuser
+  - mkdir -p /opt/flaskapp
+  - chown -R flaskuser:flaskuser /opt/flaskapp
+
+  # Créer et activer l'environnement virtuel
+  - python3 -m venv /opt/flaskapp/venv
+  - /opt/flaskapp/venv/bin/pip install --upgrade pip
+  - /opt/flaskapp/venv/bin/pip install -r /opt/flaskapp/requirements.txt
+
+  # Configurer Nginx
+  - ln -sf /etc/nginx/sites-available/flaskapp /etc/nginx/sites-enabled/
+  - rm -f /etc/nginx/sites-enabled/default
+  - systemctl enable nginx
+  - systemctl restart nginx
+
+  # Activer et démarrer le service Flask
+  - systemctl daemon-reload
+  - systemctl enable flaskapp
+  - systemctl start flaskapp

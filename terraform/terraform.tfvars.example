@@ -1,0 +1,26 @@
+# ─── Copier ce fichier en terraform.tfvars et remplir les valeurs ─────────────
+# ATTENTION : Ne jamais commiter terraform.tfvars dans Git !
+
+# Subscription Azure (az account show --query id -o tsv)
+subscription_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Général
+location            = "West Europe"
+resource_group_name = "rg-flask-app"
+project_name        = "flaskapp"
+
+# VM
+vm_size        = "Standard_B1s"
+admin_username = "azureuser"
+admin_password = "VotreMotDePasse123!"
+
+# Stockage
+storage_account_tier     = "Standard"
+storage_replication_type = "LRS"
+container_name           = "static-files"
+
+# Base de données
+db_admin_username = "pgadmin"
+db_admin_password = "VotreMotDePasseDB123!"
+db_name           = "flaskdb"
+db_sku            = "B_Standard_B1ms"
