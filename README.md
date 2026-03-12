@@ -1,12 +1,6 @@
-# Déploiement Automatisé d'Infrastructure Azure avec Terraform
+# Déploiement Infrastructure Azure avec Terraform
 
-Application Flask déployée sur Azure avec :
-- **Azure VM** (Ubuntu 22.04) — héberge l'application Flask via Gunicorn + Nginx
-- **Azure Blob Storage** — stockage des fichiers statiques (images, logs, etc.)
-- **Azure PostgreSQL Flexible Server** — base de données relationnelle
-- **API CRUD** — gestion des fichiers et de leurs métadonnées
-
----
+Application Flask déployée sur Azure via Terraform, avec stockage de fichiers sur Azure Blob Storage et métadonnées dans PostgreSQL.
 
 ## Architecture
 
@@ -18,193 +12,132 @@ Internet
     │
     ▼
 [VM Ubuntu 22.04]
-  ├── Nginx (port 80) → reverse proxy
+  ├── Nginx (port 80)  →  reverse proxy
   └── Gunicorn / Flask (port 5000)
-          │                   │
-          ▼                   ▼
-  [Azure PostgreSQL]   [Azure Blob Storage]
-  (métadonnées)        (fichiers binaires)
+            │                   │
+            ▼                   ▼
+  [Azure PostgreSQL]    [Azure Blob Storage]
+  (métadonnées)         (fichiers binaires)
 ```
 
----
+## Ressources créées (16 au total)
+
+| Ressource | Nom | Description |
+|---|---|---|
+| Resource Group | `rg-flask-app` | Conteneur de toutes les ressources |
+| Virtual Network | `flaskapp-vnet` | Réseau `10.0.0.0/16` |
+| Subnet VM | `flaskapp-subnet-vm` | `10.0.1.0/24` |
+| Subnet DB | `flaskapp-subnet-db` | `10.0.2.0/24` |
+| Public IP | `flaskapp-public-ip` | IP statique Standard |
+| NSG | `flaskapp-nsg` | Ports 22, 80, 5000 |
+| Network Interface | `flaskapp-nic` | NIC de la VM |
+| Linux VM | `flaskapp-vm` | Ubuntu 22.04, Standard_B2s_v2, zone 2 |
+| Storage Account | `flaskappstorage<suffix>` | Standard LRS |
+| Storage Container | `static-files` | Accès privé |
+| Private DNS Zone | `flaskapp.postgres.database.azure.com` | DNS privé PostgreSQL |
+| DNS VNet Link | `flaskapp-dns-link` | Lien DNS ↔ VNet |
+| PostgreSQL Server | `flaskapp-postgres` | Flexible Server v15, B_Standard_B1ms |
+| PostgreSQL DB | `flaskdb` | UTF8 |
+| NIC/NSG Association | — | Association NIC ↔ NSG |
+| Random Suffix | — | Suffixe unique pour le storage |
 
 ## Prérequis
 
-| Outil        | Version minimale | Installation |
-|--------------|-----------------|--------------|
-| Terraform    | 1.3+            | https://developer.hashicorp.com/terraform/install |
-| Azure CLI    | 2.50+           | https://learn.microsoft.com/fr-fr/cli/azure/install-azure-cli |
-| Python       | 3.10+           | https://www.python.org/ |
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.3+
+- [Azure CLI](https://learn.microsoft.com/fr-fr/cli/azure/install-azure-cli) 2.50+
 
----
+## Déploiement
 
-## Étape 1 — Configurer Azure
-
-### 1.1 Connexion à Azure CLI
+### 1. Connexion Azure
 
 ```bash
 az login
-az account show   # vérifier la subscription active
+az account show
 ```
 
-### 1.2 Créer un Service Principal Terraform
-
-```bash
-az ad sp create-for-rbac \
-  --name "terraform-flask" \
-  --role Contributor \
-  --scopes /subscriptions/<SUBSCRIPTION_ID>
-```
-
-Résultat :
-```json
-{
-  "appId":       "client_id",
-  "password":    "client_secret",
-  "tenant":      "tenant_id"
-}
-```
-
----
-
-## Étape 2 — Configurer Terraform
-
-### 2.1 Créer le fichier de variables
+### 2. Configurer les variables
 
 ```bash
 cd terraform/
 cp terraform.tfvars.example terraform.tfvars
+# éditer terraform.tfvars avec votre subscription_id, mots de passe, etc.
 ```
 
-Éditer `terraform.tfvars` et renseigner toutes les valeurs.
-
-### 2.2 Initialiser Terraform
+### 3. Déployer
 
 ```bash
 terraform init
-```
-
-### 2.3 Vérifier le plan d'exécution
-
-```bash
 terraform plan
-```
-
-### 2.4 Déployer l'infrastructure
-
-```bash
 terraform apply
 ```
 
-Taper `yes` pour confirmer. Le déploiement prend ~10 minutes.
-
-### 2.5 Récupérer les outputs
+### 4. Récupérer les outputs
 
 ```bash
 terraform output vm_public_ip
 terraform output flask_app_url
-terraform output storage_account_name
 ```
 
----
+## API — Endpoints
 
-## Étape 3 — Tester l'application
+| Méthode | Route | Description |
+|---|---|---|
+| GET | `/health` | Statut de l'application |
+| POST | `/files` | Upload d'un fichier (multipart) |
+| GET | `/files` | Liste tous les fichiers |
+| PUT | `/files/<id>` | Modifie la description |
+| DELETE | `/files/<id>` | Supprime le fichier (Blob + DB) |
 
-### Health check
+### Exemples curl
 
 ```bash
-curl http://<VM_PUBLIC_IP>/health
+# Health check
+curl http://<IP>/health
+
+# Upload
+curl -X POST http://<IP>/files -F "file=@test.txt" -F "description=Mon fichier"
+
+# Liste
+curl http://<IP>/files
+
+# Mise à jour
+curl -X PUT http://<IP>/files/<id> -H "Content-Type: application/json" -d '{"description": "Nouvelle description"}'
+
+# Suppression
+curl -X DELETE http://<IP>/files/<id>
 ```
-
-### Upload d'un fichier (CREATE)
-
-```bash
-curl -X POST http://<VM_PUBLIC_IP>/files \
-  -F "file=@mon_image.png" \
-  -F "description=Logo du projet"
-```
-
-### Lister les fichiers (READ)
-
-```bash
-curl http://<VM_PUBLIC_IP>/files
-```
-
-### Obtenir un fichier par ID (READ)
-
-```bash
-curl http://<VM_PUBLIC_IP>/files/<file_id>
-```
-
-### Modifier la description (UPDATE)
-
-```bash
-curl -X PUT http://<VM_PUBLIC_IP>/files/<file_id> \
-  -H "Content-Type: application/json" \
-  -d '{"description": "Nouvelle description"}'
-```
-
-### Supprimer un fichier (DELETE)
-
-```bash
-curl -X DELETE http://<VM_PUBLIC_IP>/files/<file_id>
-```
-
----
-
-## Développement local
-
-```bash
-cd backend/
-python3 -m venv venv
-source venv/bin/activate        # Linux/Mac
-# venv\Scripts\activate         # Windows
-
-pip install -r requirements.txt
-cp .env.example .env            # configurer les variables
-python app.py
-```
-
-L'application est accessible sur `http://localhost:5000`.
-
----
-
-## Étape 4 — Détruire l'infrastructure
-
-```bash
-cd terraform/
-terraform destroy
-```
-
-> **Attention** : cette commande supprime toutes les ressources Azure créées, y compris les données en base et dans le Blob Storage.
-
----
 
 ## Structure du projet
 
 ```
 terraform-flask-azure/
 ├── terraform/
-│   ├── provider.tf          # Configuration du provider Azure
-│   ├── main.tf              # Ressources principales (VM, Storage, DB, Réseau)
-│   ├── variables.tf         # Déclaration des variables
-│   ├── outputs.tf           # Sorties (IP publique, URLs, etc.)
-│   ├── terraform.tfvars.example
+│   ├── provider.tf              # Provider Azure (auth via az login)
+│   ├── main.tf                  # 16 ressources Azure
+│   ├── variables.tf             # Déclaration des variables
+│   ├── outputs.tf               # IP publique, URLs, FQDN
+│   ├── terraform.tfvars.example # Template de configuration
 │   └── scripts/
-│       └── cloud-init.yaml  # Provisioning automatique de la VM
+│       └── cloud-init.yaml      # Provisioning automatique de la VM
 ├── backend/
-│   ├── app.py               # Application Flask (CRUD + Azure Blob)
+│   ├── app.py                   # Flask CRUD + Azure Blob Storage
 │   ├── requirements.txt
 │   └── .env.example
+├── rapport/
+│   └── etapes.md                # Journal de déploiement
 ├── .gitignore
 └── README.md
 ```
 
----
-
 ## Sécurité
 
-- Les secrets (mots de passe, clés) sont dans `terraform.tfvars` — **ne jamais commiter ce fichier**
-- Le Blob Storage est configuré en accès **privé** (pas d'accès public anonyme)
-- Le NSG autorise uniquement les ports 22 (SSH), 80 (HTTP) et 5000 (Flask direct)
-- Les mots de passe PostgreSQL sont marqués `sensitive` dans Terraform
+- `terraform.tfvars` et `*.tfstate` exclus du dépôt Git
+- Blob Storage en accès **privé** (pas d'URL publique anonyme)
+- PostgreSQL accessible uniquement via réseau privé (`public_network_access_enabled = false`)
+- NSG restreint aux ports 22 (SSH), 80 (HTTP), 5000 (Flask)
+
+## Destruction
+
+```bash
+terraform destroy
+```
